@@ -76,6 +76,8 @@ export type ProjectPolicy = {
   version: 1;
   projectId: string;
   repoPath: string;
+  defaultModel?: string;
+  defaultProfile?: string;
   members?: Record<string, ProjectRole>;
   permissions?: Partial<Record<ProjectPermissionAction, ProjectRole[]>>;
   approval?: {

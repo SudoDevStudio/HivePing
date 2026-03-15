@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { PluginConfig } from "../types.js";
 import type { ProjectPermissionAction, ProjectPolicy, ProjectRole } from "../types.js";
 
 export const PROJECT_ROLES: readonly ProjectRole[] = ["anyone", "dev", "maintainer", "owner"];
@@ -166,11 +167,15 @@ function normalizePolicy(raw: unknown, context: PolicyNormalizeContext = {}): Pr
   const approvalRaw = asRecord(record.approval);
   const requireTicketForHeavyChange = approvalRaw.requireTicketForHeavyChange;
   const enabled = approvalRaw.enabled;
+  const defaultModel = asString(record.defaultModel);
+  const defaultProfile = asString(record.defaultProfile);
 
   return {
     version: 1,
     projectId,
     repoPath: normalizeRepoPath(repoPath),
+    ...(defaultModel ? { defaultModel } : {}),
+    ...(defaultProfile ? { defaultProfile } : {}),
     members,
     permissions,
     approval: {
@@ -420,6 +425,21 @@ export async function removeProjectMemberRole(params: {
     repoPathHint: params.repoPath,
   });
   return { policy, normalizedMemberKey, removed };
+}
+
+export function applyProjectPolicyRuntimeDefaults(
+  config: PluginConfig,
+  policy: ProjectPolicy | undefined,
+): PluginConfig {
+  if (!policy) {
+    return config;
+  }
+
+  return {
+    ...config,
+    ...(policy.defaultModel ? { defaultModel: policy.defaultModel } : {}),
+    ...(policy.defaultProfile ? { defaultProfile: policy.defaultProfile } : {}),
+  };
 }
 
 export function allowedRolesForAction(

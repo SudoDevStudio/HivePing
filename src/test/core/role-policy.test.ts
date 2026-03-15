@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  applyProjectPolicyRuntimeDefaults,
   detectHeavyChange,
   detectWriteIntent,
   extractTicketReference,
@@ -74,6 +75,27 @@ test("roleForPrincipal resolves direct principals, usernames, emails, and action
   assert.equal(isRoleAllowedForAction("owner", policy, "externalApi"), true);
   assert.equal(isRoleAllowedForAction("maintainer", policy, "externalApi"), false);
   assert.equal(minRequiredRoleForAction(policy, "externalApi"), "owner");
+});
+
+test("applyProjectPolicyRuntimeDefaults prefers project model/profile over global defaults", () => {
+  const policy = {
+    ...samplePolicy("/tmp/repo"),
+    defaultModel: "gpt-5.4",
+    defaultProfile: "review",
+  };
+
+  const merged = applyProjectPolicyRuntimeDefaults(
+    {
+      reasoningCommand: "codex",
+      defaultModel: "gpt-5-mini",
+      defaultProfile: "fast",
+    },
+    policy,
+  );
+
+  assert.equal(merged.reasoningCommand, "codex");
+  assert.equal(merged.defaultModel, "gpt-5.4");
+  assert.equal(merged.defaultProfile, "review");
 });
 
 test("ticket, write-intent, and heavy-change detection works", () => {
@@ -180,6 +202,41 @@ test("loadProjectPolicies infers repoPath and projectId from default policy dire
     assert.equal(policies[0]?.repoPath, repoPath);
     assert.equal(policies[0]?.projectId, "account-service");
     assert.equal(policies[0]?.members?.["discord:123"], "owner");
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadProjectPolicies parses optional project reasoning defaults", async () => {
+  const dir = await makeTempDir("hiveping-policy-model-defaults-");
+
+  try {
+    const repoPath = path.join(dir, "account-service");
+    const policyDir = path.join(repoPath, ".hiveping", "policies");
+    const policyPath = path.join(policyDir, "account-service.json");
+
+    await fs.mkdir(policyDir, { recursive: true });
+    await fs.writeFile(
+      policyPath,
+      `${JSON.stringify(
+        {
+          version: 1,
+          defaultModel: "gpt-5.4",
+          defaultProfile: "dev",
+          members: {
+            "discord:123": "owner",
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const policies = await loadProjectPolicies(policyDir);
+    assert.equal(policies.length, 1);
+    assert.equal(policies[0]?.defaultModel, "gpt-5.4");
+    assert.equal(policies[0]?.defaultProfile, "dev");
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }

@@ -26,6 +26,7 @@ import {
   resolveSkillsFilePath,
 } from "../core/skill-router.js";
 import {
+  applyProjectPolicyRuntimeDefaults,
   approverRoles,
   detectHeavyChange,
   detectWriteIntent,
@@ -230,13 +231,14 @@ async function naturalizeExternalActionResponse(params: {
   userPrompt: string;
   actionName: string;
   rawResponse: string;
+  configOverride?: PluginConfig;
 }): Promise<string> {
   if (!shouldNaturalizeExternalActionResponse(params.rawResponse)) {
     return params.rawResponse;
   }
 
   const formatConfig: PluginConfig = {
-    ...params.deps.config,
+    ...(params.configOverride || params.deps.config),
     defaultSandbox: "read-only",
     defaultApprovalPolicy: "never",
   };
@@ -922,7 +924,12 @@ function formatRoleMembersText(policy: ProjectPolicy): string {
     left[0].localeCompare(right[0]),
   );
 
-  const lines = [`Project: ${policy.projectId}`, `Repo: ${policy.repoPath}`];
+  const lines = [
+    `Project: ${policy.projectId}`,
+    `Repo: ${policy.repoPath}`,
+    `Default model: ${policy.defaultModel || "(inherit hiveping default)"}`,
+    `Default profile: ${policy.defaultProfile || "(inherit hiveping default)"}`,
+  ];
 
   if (members.length === 0) {
     lines.push("Members: none (all users resolve to role anyone unless mapped)");
@@ -1307,18 +1314,19 @@ function skillRoutingMode(config: PluginConfig): "rules" | "agent" {
 }
 
 async function resolveSkillMatchForAsk(params: {
+  config: PluginConfig;
   deps: GovernDeps;
   repoPath: string;
   conversationKey: string;
   askPrompt: string;
 }): Promise<{ matched: ReturnType<typeof matchSkillRoute>; sourceLabel: string }> {
-  const mode = skillRoutingMode(params.deps.config);
+  const mode = skillRoutingMode(params.config);
 
   if (mode === "agent") {
     try {
       const recentHistory = await params.deps.history.recent(params.conversationKey, 12);
       const semanticMatch = await matchSkillRouteWithAgent({
-        config: params.deps.config,
+        config: params.config,
         repoPath: params.repoPath,
         userPrompt: params.askPrompt,
         history: recentHistory,
@@ -1335,7 +1343,7 @@ async function resolveSkillMatchForAsk(params: {
     }
   }
 
-  const routes = await loadSkillRoutes(params.deps.config, params.repoPath);
+  const routes = await loadSkillRoutes(params.config, params.repoPath);
   const matched = matchSkillRoute(params.askPrompt, routes);
   return {
     matched,
@@ -1495,9 +1503,10 @@ async function handleApprovalDecision(params: {
   enforceProjectAccessForRepo("ask", request.repoPath, authorization.decision, params.conversationKey);
 
   if (request.requestType === "external-action" || request.requestType === "webhook-action") {
+    const requestConfig = applyProjectPolicyRuntimeDefaults(authorization.effectiveConfig, policy);
     const history = await params.deps.history.recent(params.conversationKey, 20);
     const actionResult = await executeApprovedWebhookAction({
-      config: authorization.effectiveConfig,
+      config: requestConfig,
       request,
       approvedBy: approverId,
       approvalReason: parsed.reason,
@@ -1520,6 +1529,7 @@ async function handleApprovalDecision(params: {
       userPrompt: externalActionUserPrompt(request),
       actionName,
       rawResponse: actionResult.responseSummary,
+      configOverride: requestConfig,
     });
 
     return {
@@ -1543,7 +1553,10 @@ async function handleApprovalDecision(params: {
     );
   }
 
-  const writeConfig = writeExecutionConfig(authorization.effectiveConfig, authorization.apiReadOnlyForced);
+  const writeConfig = applyProjectPolicyRuntimeDefaults(
+    writeExecutionConfig(authorization.effectiveConfig, authorization.apiReadOnlyForced),
+    policy,
+  );
   const result = await runCodexWithHistory({
     prompt: request.prompt,
     conversationKey: params.conversationKey,
@@ -1656,7 +1669,7 @@ async function executeExternalActionDirectly(params: {
   });
 
   const actionResult = await executeApprovedWebhookAction({
-    config: params.deps.config,
+    config: applyProjectPolicyRuntimeDefaults(params.deps.config, params.policy),
     request,
     approvedBy: params.actorId,
     approvalReason: "Auto-approved by externalApi permission",
@@ -1673,11 +1686,12 @@ async function executeExternalActionDirectly(params: {
   const naturalResponse = await naturalizeExternalActionResponse({
     deps: params.deps,
     repoPath: params.repoPath,
-    conversationKey: params.conversationKey,
-    userPrompt: asString(asRecord(asRecord(params.actionPayload).input).prompt) || params.actionSummary,
-    actionName: params.actionName,
-    rawResponse: actionResult.responseSummary,
-  });
+      conversationKey: params.conversationKey,
+      userPrompt: asString(asRecord(asRecord(params.actionPayload).input).prompt) || params.actionSummary,
+      actionName: params.actionName,
+      rawResponse: actionResult.responseSummary,
+      configOverride: applyProjectPolicyRuntimeDefaults(params.deps.config, params.policy),
+    });
 
   return {
     text: [
@@ -2145,6 +2159,7 @@ async function executeGovernArgs(
   });
 
   const skillMatch = await resolveSkillMatchForAsk({
+    config: applyProjectPolicyRuntimeDefaults(authorization.effectiveConfig, policy),
     deps,
     repoPath: binding.repoPath,
     conversationKey,
@@ -2212,7 +2227,7 @@ async function executeGovernArgs(
     return await runAskPrompt(askPrompt, conversationKey, deps, {
       binding,
       actorLabel: actorId,
-      configOverride: authorization.effectiveConfig,
+      configOverride: applyProjectPolicyRuntimeDefaults(authorization.effectiveConfig, policy),
     });
   }
 
@@ -2268,7 +2283,10 @@ async function executeGovernArgs(
     };
   }
 
-  const writeConfig = writeExecutionConfig(authorization.effectiveConfig, authorization.apiReadOnlyForced);
+  const writeConfig = applyProjectPolicyRuntimeDefaults(
+    writeExecutionConfig(authorization.effectiveConfig, authorization.apiReadOnlyForced),
+    policy,
+  );
 
   return await runAskPrompt(askPrompt, conversationKey, deps, {
     binding,

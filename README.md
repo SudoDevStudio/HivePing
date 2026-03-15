@@ -228,6 +228,8 @@ Example file path:
 ```json
 {
   "version": 1,
+  "defaultModel": "gpt-5.4",
+  "defaultProfile": "dev",
   "members": {
     "email:engineer@company.com": "dev",
     "email:lead@company.com": "maintainer",
@@ -261,6 +263,7 @@ Notes:
 
 - `projectId` is optional. If omitted, HivePing uses the bound repo folder name.
 - `repoPath` is optional. If omitted, HivePing infers it from the default policy location (`<bound-repo>/.hiveping/policies`).
+- `defaultModel` and `defaultProfile` are optional. If set, they override the HivePing-wide defaults for that bound project only.
 - Keep `repoPath` explicit only when you use a shared/custom policy directory that is not under the bound repo.
 
 Behavior:
@@ -272,6 +275,7 @@ Behavior:
   - `@hiveping role remove engineer@company.com`
 - Read asks follow `permissions.ask`.
 - Write asks (`change`, `update`, `edit`, `fix`, or write-intent text) follow `permissions.change`.
+- Reasoning model/profile fall back in this order: project policy -> HivePing runtime config -> reasoning backend defaults.
 - If user is below minimum change role, HivePing creates an approval request and returns an ID.
 - Maintainer/owner approves with `@hiveping approve <request-id>`.
 - Heavy write requests require Jira/GitHub ticket reference in prompt (for example `ABC-123` or `#245`).
