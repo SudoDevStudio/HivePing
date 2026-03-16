@@ -405,6 +405,128 @@ In any connected channel/thread:
 @hiveping unbind
 ```
 
+## Project-Specific Agent Profiles
+
+HivePing can also run in an optional agent-profile mode alongside the existing conversation-scoped binding flow.
+
+This lets you keep the current behavior for `@hiveping`, while also configuring fixed project agents such as `@hiveping1` and `@hiveping2`.
+
+Example plugin config:
+
+```json
+{
+  "mentionAliases": ["@hiveping"],
+  "agents": [
+    {
+      "id": "fe",
+      "aliases": ["@hiveping1"],
+      "repoPath": "/workspace/YOUR_DIR/frontend-app",
+      "homeConversationKey": "slack:T123:C_FE"
+    },
+    {
+      "id": "api",
+      "aliases": ["@hiveping2"],
+      "repoPath": "/workspace/YOUR_DIR/api-service",
+      "homeConversationKey": "slack:T123:C_API"
+    }
+  ]
+}
+```
+
+Behavior:
+
+- `@hiveping ...` keeps the current conversation-scoped flow and uses the repo bound in the current channel/thread.
+- `@hiveping1 ...` uses the fixed `frontend-app` repo and the history stored under `slack:T123:C_FE`, even if the message was sent in a shared channel.
+- `@hiveping2 ...` uses the fixed `api-service` repo and the history stored under `slack:T123:C_API`.
+- If a single message mentions multiple configured agent aliases like `@hiveping1 @hiveping2 investigate checkout failure`, HivePing runs both agents independently and returns one consolidated reply with separate findings sections.
+- This is useful for shared integration channels where multiple project-specific agents need to answer with their own repo context and home-channel memory.
+- `bind` and `unbind` stay conversation-scoped commands. Agent profiles use fixed repo mappings from plugin config.
+- If your platform sends raw bot mention IDs like `<@U123>`, set `mentionIds` on the agent profile so HivePing can distinguish multiple bot identities reliably.
+- Every agent id also gets plain-text aliases automatically as both the raw id and the parenthesized form. For example, agent id `frontend` can be invoked as `frontend` or `(frontend)`.
+- If an agent id contains spaces, use the parenthesized form like `(project a)` or `(frontend app)`.
+- Parenthesized aliases are treated as leading routing indicators, so normal questions like `what is meta(meta tags) of this project` are not re-routed accidentally.
+- If you want to keep project agents private to certain rooms, set `allowedChannels` on the agent profile. Matching is exact against the current conversation key, raw channel id, and provider metadata such as `channelName` when the adapter includes it.
+
+How to configure agent profiles today:
+
+- `homeConversationKey` can be discovered from chat by running `@hiveping status` in the channel or thread you want to use as that agent's shared memory home, then copying the `Key: ...` value from the reply.
+- Saving `agents` is currently done through OpenClaw config / CLI, not through `@hiveping config set ...`.
+
+Get the home keys from chat:
+
+```text
+# In the frontend home channel/thread
+@hiveping status
+
+# In the API home channel/thread
+@hiveping status
+```
+
+Then persist the agent profiles:
+
+```bash
+docker compose run --rm openclaw-cli config set plugins.entries.hiveping.config.agents '[
+  {
+    "id": "fe",
+    "aliases": ["@hiveping1"],
+    "repoPath": "/workspace/YOUR_DIR/frontend-app",
+    "homeConversationKey": "slack:T123:C_FE",
+    "allowedChannels": ["frontend-room", "slack:default:C123FE"]
+  },
+  {
+    "id": "api",
+    "aliases": ["@hiveping2"],
+    "repoPath": "/workspace/YOUR_DIR/api-service",
+    "homeConversationKey": "slack:T123:C_API",
+    "allowedChannels": ["api-room", "slack:default:C456API"]
+  }
+]' --json
+```
+
+Optional: keep the default conversation-scoped alias enabled too:
+
+```bash
+docker compose run --rm openclaw-cli config set plugins.entries.hiveping.config.mentionAliases '["@hiveping"]' --json
+```
+
+Optional: if your platform exposes stable bot/account mention IDs, add them for more reliable routing:
+
+```bash
+docker compose run --rm openclaw-cli config set plugins.entries.hiveping.config.agents '[
+  {
+    "id": "fe",
+    "aliases": ["@webbot"],
+    "mentionIds": ["U08FRONTEND"],
+    "repoPath": "/workspace/YOUR_DIR/frontend-app",
+    "homeConversationKey": "slack:T123:C_FE"
+  },
+  {
+    "id": "api",
+    "aliases": ["@apibot"],
+    "mentionIds": ["U08BACKEND"],
+    "repoPath": "/workspace/YOUR_DIR/api-service",
+    "homeConversationKey": "slack:T123:C_API"
+  }
+]' --json
+```
+
+Restart the gateway after updating plugin config:
+
+```bash
+docker compose restart openclaw-gateway
+```
+
+Smoke test from a shared channel:
+
+```text
+@hiveping1 status
+@hiveping2 status
+@hiveping1 @hiveping2 investigate checkout failure
+@hiveping (frontend) status
+@hiveping (frontend) (api) investigate checkout failure
+@hiveping (project a) status
+```
+
 Approval flow:
 
 ```text
@@ -412,6 +534,37 @@ Approval flow:
 # -> returns: Approval request created: appr_xxx
 @hiveping approve appr_xxx
 ```
+
+Reusable external-action approvals:
+
+```text
+@hiveping what version is deployed right now?
+# -> returns: Approval request created: appr_xxx
+
+@hiveping approve appr_xxx --future 10 --scope requester
+# allow the same requester to run the same external action 10 more times
+
+@hiveping approve appr_xxx --future 1d --scope all
+# allow everyone in that project context to run the same external action for 1 day
+
+@hiveping grants
+# list active reusable approvals for the current bound project / agent context
+
+@hiveping revoke grant_xxx
+@hiveping revoke appr_xxx
+@hiveping revoke deployed.version
+```
+
+Notes:
+
+- Reusable approvals currently apply only to external actions, not code changes.
+- Matching is project-scoped and action-name scoped.
+- In agent-profile mode, reusable approvals are also scoped to that agent profile by default.
+- `--scope requester` reuses approval only for the original requester.
+- `--scope all` allows any user in that same project context to reuse it until the limit expires.
+- `--future 10` means the next 10 matching requests.
+- `--future 1d`, `12h`, `30m`, and `1w` are also supported.
+- Grants are persisted in the default local store at `.hiveping/approval-grants.json`.
 
 Approval-gated external action:
 

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { ApprovalGrantStore } from "../../core/approval-grant-store.js";
 import { ApprovalStore } from "../../core/approval-store.js";
 import { BindingStore } from "../../core/binding-store.js";
 import { HistoryStore } from "../../core/history-store.js";
@@ -191,6 +192,73 @@ test("ApprovalStore normalizes legacy webhook-action records", async () => {
       description: "Retries are not capped",
       labels: ["bug"],
     });
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ApprovalGrantStore consumes and revokes grants", async () => {
+  const dir = await makeTempDir("hiveping-grants-");
+
+  try {
+    const filePath = path.join(dir, "approval-grants.json");
+    const store = new ApprovalGrantStore(filePath);
+
+    const grant = await store.create({
+      projectId: "account-service",
+      repoPath: "/workspace/account-service",
+      actionName: "deployed.version",
+      scope: "requester",
+      grantedTo: "slack:U1",
+      remainingUses: 2,
+      createdBy: "slack:OWNER",
+      sourceRequestId: "appr_123",
+    });
+
+    assert.match(grant.id, /^grant_/);
+
+    const firstUse = await store.consumeMatching({
+      repoPath: "/workspace/account-service",
+      actionName: "deployed.version",
+      requestedBy: "slack:U1",
+    });
+    assert.equal(firstUse?.remainingUses, 1);
+
+    const secondUse = await store.consumeMatching({
+      repoPath: "/workspace/account-service",
+      actionName: "deployed.version",
+      requestedBy: "slack:U1",
+    });
+    assert.equal(secondUse?.status, "exhausted");
+    assert.equal(await store.consumeMatching({
+      repoPath: "/workspace/account-service",
+      actionName: "deployed.version",
+      requestedBy: "slack:U1",
+    }), undefined);
+
+    const broadGrant = await store.create({
+      projectId: "account-service",
+      repoPath: "/workspace/account-service",
+      actionName: "jira.issue.create",
+      scope: "all",
+      expiresAt: "2026-03-20T00:00:00.000Z",
+      createdBy: "slack:OWNER",
+      sourceRequestId: "appr_456",
+    });
+
+    const revoked = await store.revokeMatching({
+      repoPath: "/workspace/account-service",
+      actionName: "jira.issue.create",
+      revokedBy: "slack:OWNER",
+      revokedReason: "turning it off",
+    });
+    assert.equal(revoked.length, 1);
+    assert.equal(revoked[0]?.id, broadGrant.id);
+
+    const reloaded = new ApprovalGrantStore(filePath);
+    const reloadedGrant = await reloaded.get(broadGrant.id);
+    assert.equal(reloadedGrant?.status, "revoked");
+    assert.equal(reloadedGrant?.revokedBy, "slack:OWNER");
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }

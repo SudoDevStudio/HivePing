@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { ApprovalGrantStore } from "../../core/approval-grant-store.js";
 import { ApprovalStore } from "../../core/approval-store.js";
 import { BindingStore } from "../../core/binding-store.js";
 import { HistoryStore } from "../../core/history-store.js";
@@ -11,15 +12,17 @@ import { registerMentionHook, resetMentionHookStateForTests } from "../../hooks/
 
 type HookHandler = (event: unknown, ctx: unknown) => Promise<unknown> | unknown;
 
-function createDeps() {
+function createDeps(config: Record<string, unknown> = {}) {
   const root = mkdtempSync(path.join(tmpdir(), "hiveping-mention-hook-"));
   return {
     config: {
       mentionHookEnabled: true,
       rolePolicyEnabled: false,
+      ...config,
     },
     store: new BindingStore(path.join(root, "bindings.json")),
     approvals: new ApprovalStore(path.join(root, "approvals.json")),
+    grants: new ApprovalGrantStore(path.join(root, "grants.json")),
     history: new HistoryStore(path.join(root, "history.json")),
     historyMaxMessages: 20,
   };
@@ -238,6 +241,318 @@ test("mention hook accepts @hiveping alias", async () => {
   const suppressed = await messageSending?.(
     { to: "channel:hiveping-alias" },
     { channelId: "discord", conversationId: "channel:hiveping-alias" },
+  );
+  assert.equal(suppressed?.cancel, true);
+});
+
+test("mention hook routes agent aliases to fixed project context", async () => {
+  const { api, handlers, deliveries, sendReply } = createApiHarness();
+  registerMentionHook(
+    api,
+    createDeps({
+      agents: [
+        {
+          id: "fe",
+          aliases: ["@hiveping1"],
+          repoPath: "/workspace/frontend-app",
+          homeConversationKey: "slack:T_DEFAULT:C_FE",
+        },
+      ],
+    }),
+    { sendReply },
+  );
+
+  const messageReceived = handlers.get("message_received");
+  const messageSending = handlers.get("message_sending");
+  assert.ok(messageReceived);
+  assert.ok(messageSending);
+
+  const handled = await messageReceived?.(
+    {
+      from: "slack:U123",
+      content: "@hiveping1 status",
+      metadata: {
+        to: "channel:C_SHARED",
+        wasMentioned: true,
+      },
+    },
+    {
+      channelId: "slack",
+      conversationId: "channel:C_SHARED",
+    },
+  );
+
+  assert.equal(handled?.cancel, true);
+  assert.equal(deliveries.length, 1);
+  assert.match(deliveries[0]?.content || "", /Agent: fe/);
+  assert.match(deliveries[0]?.content || "", /History key: slack:T_DEFAULT:C_FE/);
+  assert.match(deliveries[0]?.content || "", /\/workspace\/frontend-app/);
+
+  const suppressed = await messageSending?.(
+    { to: "channel:C_SHARED" },
+    { channelId: "slack", conversationId: "channel:C_SHARED" },
+  );
+  assert.equal(suppressed?.cancel, true);
+});
+
+test("mention hook supports parenthesized derived agent aliases from agent id", async () => {
+  const { api, handlers, deliveries, sendReply } = createApiHarness();
+  registerMentionHook(
+    api,
+    createDeps({
+      agents: [
+        {
+          id: "frontend",
+          repoPath: "/workspace/frontend-app",
+          homeConversationKey: "slack:T_DEFAULT:C_FE",
+        },
+      ],
+    }),
+    { sendReply },
+  );
+
+  const messageReceived = handlers.get("message_received");
+  assert.ok(messageReceived);
+
+  const handled = await messageReceived?.(
+    {
+      from: "slack:U123",
+      content: "@hiveping (frontend) status",
+      metadata: {
+        to: "channel:C_SHARED",
+        wasMentioned: true,
+      },
+    },
+    {
+      channelId: "slack",
+      conversationId: "channel:C_SHARED",
+    },
+  );
+
+  assert.equal(handled?.cancel, true);
+  assert.equal(deliveries.length, 1);
+  assert.match(deliveries[0]?.content || "", /Agent: frontend/);
+  assert.match(deliveries[0]?.content || "", /History key: slack:T_DEFAULT:C_FE/);
+});
+
+test("mention hook supports parenthesized derived agent aliases for ids with spaces", async () => {
+  const { api, handlers, deliveries, sendReply } = createApiHarness();
+  registerMentionHook(
+    api,
+    createDeps({
+      agents: [
+        {
+          id: "project a",
+          repoPath: "/workspace/project-a",
+          homeConversationKey: "slack:T_DEFAULT:C_PROJECT_A",
+        },
+      ],
+    }),
+    { sendReply },
+  );
+
+  const messageReceived = handlers.get("message_received");
+  assert.ok(messageReceived);
+
+  const handled = await messageReceived?.(
+    {
+      from: "slack:U123",
+      content: "@hiveping (project a) status",
+      metadata: {
+        to: "channel:C_SHARED",
+        wasMentioned: true,
+      },
+    },
+    {
+      channelId: "slack",
+      conversationId: "channel:C_SHARED",
+    },
+  );
+
+  assert.equal(handled?.cancel, true);
+  assert.equal(deliveries.length, 1);
+  assert.match(deliveries[0]?.content || "", /Agent: project a/);
+  assert.match(deliveries[0]?.content || "", /History key: slack:T_DEFAULT:C_PROJECT_A/);
+});
+
+test("mention hook does not treat parenthesized agent aliases inside normal questions as routing indicators", async () => {
+  const { api, handlers, deliveries, sendReply } = createApiHarness();
+  registerMentionHook(
+    api,
+    createDeps({
+      agents: [
+        {
+          id: "project-a",
+          repoPath: "/workspace/project-a",
+          homeConversationKey: "slack:T_DEFAULT:C_PROJECT_A",
+        },
+      ],
+    }),
+    { sendReply },
+  );
+
+  const messageReceived = handlers.get("message_received");
+  assert.ok(messageReceived);
+
+  const handled = await messageReceived?.(
+    {
+      from: "slack:U123",
+      content: "@hiveping what is meta(project-a tags) of this project",
+      metadata: {
+        to: "channel:C_SHARED",
+        wasMentioned: true,
+      },
+    },
+    {
+      channelId: "slack",
+      conversationId: "channel:C_SHARED",
+    },
+  );
+
+  assert.equal(handled?.cancel, true);
+  assert.equal(deliveries.length, 1);
+  assert.doesNotMatch(deliveries[0]?.content || "", /Agent: project-a/);
+  assert.match(deliveries[0]?.content || "", /No repository is bound/);
+});
+
+test("mention hook allows agent routing only in configured channels", async () => {
+  const { api, handlers, deliveries, sendReply } = createApiHarness();
+  registerMentionHook(
+    api,
+    createDeps({
+      agents: [
+        {
+          id: "project-a",
+          repoPath: "/workspace/project-a",
+          homeConversationKey: "slack:T_DEFAULT:C_PROJECT_A",
+          allowedChannels: ["project-a-room"],
+        },
+      ],
+    }),
+    { sendReply },
+  );
+
+  const messageReceived = handlers.get("message_received");
+  assert.ok(messageReceived);
+
+  const handled = await messageReceived?.(
+    {
+      from: "slack:U123",
+      content: "@hiveping (project-a) status",
+      metadata: {
+        to: "channel:C_ALLOWED",
+        channelName: "project-a-room",
+        wasMentioned: true,
+      },
+    },
+    {
+      channelId: "slack",
+      conversationId: "channel:C_ALLOWED",
+    },
+  );
+
+  assert.equal(handled?.cancel, true);
+  assert.equal(deliveries.length, 1);
+  assert.match(deliveries[0]?.content || "", /Agent: project-a/);
+});
+
+test("mention hook blocks agent routing outside configured channels", async () => {
+  const { api, handlers, deliveries, sendReply } = createApiHarness();
+  registerMentionHook(
+    api,
+    createDeps({
+      agents: [
+        {
+          id: "project-a",
+          repoPath: "/workspace/project-a",
+          homeConversationKey: "slack:T_DEFAULT:C_PROJECT_A",
+          allowedChannels: ["project-a-room"],
+        },
+      ],
+    }),
+    { sendReply },
+  );
+
+  const messageReceived = handlers.get("message_received");
+  assert.ok(messageReceived);
+
+  const handled = await messageReceived?.(
+    {
+      from: "slack:U123",
+      content: "@hiveping (project-a) status",
+      metadata: {
+        to: "channel:C_OTHER",
+        channelName: "shared-room",
+        wasMentioned: true,
+      },
+    },
+    {
+      channelId: "slack",
+      conversationId: "channel:C_OTHER",
+    },
+  );
+
+  assert.equal(handled?.cancel, true);
+  assert.equal(deliveries.length, 1);
+  assert.match(deliveries[0]?.content || "", /not allowed in this channel/i);
+  assert.match(deliveries[0]?.content || "", /project-a-room/);
+  assert.doesNotMatch(deliveries[0]?.content || "", /No repository is bound/);
+});
+
+test("mention hook consolidates responses when multiple agent aliases are mentioned", async () => {
+  const { api, handlers, deliveries, sendReply } = createApiHarness();
+  registerMentionHook(
+    api,
+    createDeps({
+      agents: [
+        {
+          id: "fe",
+          aliases: ["@hiveping1"],
+          repoPath: "/workspace/frontend-app",
+          homeConversationKey: "slack:T_DEFAULT:C_FE",
+        },
+        {
+          id: "api",
+          aliases: ["@hiveping2"],
+          repoPath: "/workspace/api-service",
+          homeConversationKey: "slack:T_DEFAULT:C_API",
+        },
+      ],
+    }),
+    { sendReply },
+  );
+
+  const messageReceived = handlers.get("message_received");
+  const messageSending = handlers.get("message_sending");
+  assert.ok(messageReceived);
+  assert.ok(messageSending);
+
+  const handled = await messageReceived?.(
+    {
+      from: "slack:U123",
+      content: "@hiveping1 @hiveping2 status",
+      metadata: {
+        to: "channel:C_SHARED",
+        wasMentioned: true,
+      },
+    },
+    {
+      channelId: "slack",
+      conversationId: "channel:C_SHARED",
+    },
+  );
+
+  assert.equal(handled?.cancel, true);
+  assert.equal(deliveries.length, 1);
+  assert.match(deliveries[0]?.content || "", /Consolidated multi-agent response/);
+  assert.match(deliveries[0]?.content || "", /== fe ==/);
+  assert.match(deliveries[0]?.content || "", /History key: slack:T_DEFAULT:C_FE/);
+  assert.match(deliveries[0]?.content || "", /== api ==/);
+  assert.match(deliveries[0]?.content || "", /History key: slack:T_DEFAULT:C_API/);
+
+  const suppressed = await messageSending?.(
+    { to: "channel:C_SHARED" },
+    { channelId: "slack", conversationId: "channel:C_SHARED" },
   );
   assert.equal(suppressed?.cancel, true);
 });

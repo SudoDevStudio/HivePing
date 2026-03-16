@@ -1,4 +1,5 @@
 import path from "node:path";
+import { ApprovalGrantStore } from "./core/approval-grant-store.js";
 import { ApprovalStore } from "./core/approval-store.js";
 import { BindingStore } from "./core/binding-store.js";
 import { primaryStoragePath } from "./core/branding.js";
@@ -68,12 +69,14 @@ export default function register(api: any): void {
   const approvals = new ApprovalStore(
     config.approvalRequestsFile || resolveStoragePathFromConfig(api, undefined, "approval-requests.json"),
   );
+  const grants = new ApprovalGrantStore(resolveStoragePathFromConfig(api, undefined, "approval-grants.json"));
   const history = new HistoryStore(resolveStoragePathFromConfig(api, undefined, "history.json"));
 
   const deps = {
     config,
     store,
     approvals,
+    grants,
     history,
     approvalsFilePath: config.approvalRequestsFile,
     historyMaxMessages: 30,

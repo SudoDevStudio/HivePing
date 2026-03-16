@@ -5,6 +5,7 @@ import {
   externalActionUsage,
   parseExternalActionInput,
 } from "../core/action-webhook.js";
+import { ApprovalGrantStore } from "../core/approval-grant-store.js";
 import { ApprovalStore } from "../core/approval-store.js";
 import { BindingStore } from "../core/binding-store.js";
 import { HistoryStore } from "../core/history-store.js";
@@ -53,6 +54,9 @@ import {
 import { PLUGIN_NAME, PRIMARY_MENTION_ALIAS, primaryStoragePath } from "../core/branding.js";
 import { resolveConversationKey } from "../providers/index.js";
 import type {
+  AgentProfile,
+  ApprovalGrant,
+  ApprovalGrantScope,
   BindingMetadata,
   ConversationBinding,
   ConversationKeyContext,
@@ -66,6 +70,7 @@ export type GovernDeps = {
   config: PluginConfig;
   store: BindingStore;
   approvals: ApprovalStore;
+  grants: ApprovalGrantStore;
   history: HistoryStore;
   historyMaxMessages?: number;
   approvalsFilePath?: string;
@@ -80,6 +85,13 @@ type AskOptions = {
   binding?: ConversationBinding;
   actorLabel?: string;
   configOverride?: PluginConfig;
+  historyConversationKey?: string;
+};
+
+type GovernExecutionOptions = {
+  agentProfile?: AgentProfile;
+  fixedBinding?: ConversationBinding;
+  historyConversationKey?: string;
 };
 
 type AuthorizationResult = {
@@ -102,6 +114,24 @@ type RoleCommandArgs =
   | { action: "list" }
   | { action: "set"; memberKey: string; role: ProjectRole }
   | { action: "remove"; memberKey: string };
+
+type FutureGrantSpec = {
+  remainingUses?: number;
+  expiresAt?: string;
+};
+
+type ApprovalCommandArgs = {
+  requestId: string;
+  reason?: string;
+  future?: FutureGrantSpec;
+  scope?: ApprovalGrantScope;
+};
+
+type RevokeCommandArgs = {
+  target: string;
+  reason?: string;
+  scope?: ApprovalGrantScope;
+};
 
 type ManagedConfigKey =
   | "reasoningCommand"
@@ -153,6 +183,37 @@ function noRepositoryBoundMessage(conversationKey?: string): string {
     lines.push(`Run ${PRIMARY_MENTION_ALIAS} bind <repo-path> first.`);
   }
   return lines.join("\n");
+}
+
+function agentBoundCommandMessage(agentProfile: AgentProfile, command: "bind" | "unbind"): string {
+  return [
+    `Agent profile "${agentProfile.id}" uses a fixed repository binding.`,
+    `Use ${PRIMARY_MENTION_ALIAS} ${command} in conversation-scoped mode, or update the agent config instead.`,
+  ].join("\n");
+}
+
+function effectiveHistoryConversationKey(
+  conversationKey: string,
+  execution: GovernExecutionOptions,
+): string {
+  return execution.historyConversationKey || conversationKey;
+}
+
+function formatGrantLimit(grant: Pick<ApprovalGrant, "remainingUses" | "expiresAt">): string {
+  if (typeof grant.remainingUses === "number") {
+    return `remaining uses: ${grant.remainingUses}`;
+  }
+  if (grant.expiresAt) {
+    return `expires: ${grant.expiresAt}`;
+  }
+  return "limit: unlimited";
+}
+
+function formatGrantScopeText(grant: Pick<ApprovalGrant, "scope" | "grantedTo">): string {
+  if (grant.scope === "requester") {
+    return `scope: requester${grant.grantedTo ? ` (${grant.grantedTo})` : ""}`;
+  }
+  return "scope: all";
 }
 
 function formatError(error: unknown): string {
@@ -228,6 +289,7 @@ async function naturalizeExternalActionResponse(params: {
   deps: GovernDeps;
   repoPath: string;
   conversationKey: string;
+  historyConversationKey?: string;
   userPrompt: string;
   actionName: string;
   rawResponse: string;
@@ -243,7 +305,10 @@ async function naturalizeExternalActionResponse(params: {
     defaultApprovalPolicy: "never",
   };
 
-  const recentHistory = await params.deps.history.recent(params.conversationKey, 8);
+  const recentHistory = await params.deps.history.recent(
+    params.historyConversationKey || params.conversationKey,
+    8,
+  );
 
   try {
     const result = await callReasoningOnce(
@@ -329,18 +394,139 @@ function parseBindArgs(rawArgs: string): BindArgs {
   };
 }
 
-function parseApprovalCommandArgs(rawArgs: string): { requestId: string; reason?: string } {
+function parseGrantScope(rawValue: string): ApprovalGrantScope {
+  const normalized = rawValue.trim().toLowerCase();
+  if (normalized === "requester" || normalized === "user" || normalized === "requested-user") {
+    return "requester";
+  }
+  if (normalized === "all" || normalized === "everyone") {
+    return "all";
+  }
+  throw new Error('Grant scope expects "requester" or "all".');
+}
+
+function parseFutureGrantSpec(rawValue: string): FutureGrantSpec {
+  const trimmed = rawValue.trim().toLowerCase();
+  if (!trimmed) {
+    throw new Error("Missing value for --future.");
+  }
+
+  if (/^\d+$/.test(trimmed)) {
+    const remainingUses = Number(trimmed);
+    if (!Number.isFinite(remainingUses) || remainingUses < 1) {
+      throw new Error("--future count must be >= 1.");
+    }
+    return { remainingUses: Math.floor(remainingUses) };
+  }
+
+  const durationMatch = trimmed.match(/^(\d+)([mhdw])$/);
+  if (!durationMatch) {
+    throw new Error('Future approval expects a count like "10" or a duration like "1d", "12h", or "30m".');
+  }
+
+  const amount = Number(durationMatch[1]);
+  const unit = durationMatch[2];
+  const multipliers: Record<string, number> = {
+    m: 60_000,
+    h: 60 * 60_000,
+    d: 24 * 60 * 60_000,
+    w: 7 * 24 * 60 * 60_000,
+  };
+  const durationMs = amount * multipliers[unit];
+  if (!Number.isFinite(durationMs) || durationMs <= 0) {
+    throw new Error("Future approval duration must be positive.");
+  }
+
+  return {
+    expiresAt: new Date(Date.now() + durationMs).toISOString(),
+  };
+}
+
+function parseApprovalCommandArgs(rawArgs: string): ApprovalCommandArgs {
   const tokens = tokenizeArgs(rawArgs);
   const requestId = tokens[0];
 
   if (!requestId) {
     throw new Error(
-      `Usage: ${PRIMARY_MENTION_ALIAS} approve <request-id> OR ${PRIMARY_MENTION_ALIAS} reject <request-id> [reason]`,
+      [
+        `Usage: ${PRIMARY_MENTION_ALIAS} approve <request-id> [--future 10|1d] [--scope requester|all] [reason]`,
+        `   or: ${PRIMARY_MENTION_ALIAS} reject <request-id> [reason]`,
+      ].join("\n"),
     );
   }
 
-  const reason = tokens.length > 1 ? tokens.slice(1).join(" ") : undefined;
-  return { requestId, reason };
+  let future: FutureGrantSpec | undefined;
+  let scope: ApprovalGrantScope | undefined;
+  const reasonTokens: string[] = [];
+
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+
+    if (token === "--future") {
+      const next = tokens[index + 1];
+      if (!next) {
+        throw new Error("Missing value after --future.");
+      }
+      future = parseFutureGrantSpec(next);
+      index += 1;
+      continue;
+    }
+
+    if (token === "--scope") {
+      const next = tokens[index + 1];
+      if (!next) {
+        throw new Error("Missing value after --scope.");
+      }
+      scope = parseGrantScope(next);
+      index += 1;
+      continue;
+    }
+
+    reasonTokens.push(token);
+  }
+
+  if (scope && !future) {
+    throw new Error("--scope can only be used together with --future.");
+  }
+
+  return {
+    requestId,
+    ...(future ? { future } : {}),
+    ...(scope ? { scope } : {}),
+    ...(reasonTokens.length > 0 ? { reason: reasonTokens.join(" ") } : {}),
+  };
+}
+
+function parseRevokeCommandArgs(rawArgs: string): RevokeCommandArgs {
+  const tokens = tokenizeArgs(rawArgs);
+  const target = tokens[0];
+  if (!target) {
+    throw new Error(
+      `Usage: ${PRIMARY_MENTION_ALIAS} revoke <grant-id|request-id|action-name> [--scope requester|all] [reason]`,
+    );
+  }
+
+  let scope: ApprovalGrantScope | undefined;
+  const reasonTokens: string[] = [];
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === "--scope") {
+      const next = tokens[index + 1];
+      if (!next) {
+        throw new Error("Missing value after --scope.");
+      }
+      scope = parseGrantScope(next);
+      index += 1;
+      continue;
+    }
+    reasonTokens.push(token);
+  }
+
+  return {
+    target,
+    ...(scope ? { scope } : {}),
+    ...(reasonTokens.length > 0 ? { reason: reasonTokens.join(" ") } : {}),
+  };
 }
 
 function parseActionCommandArgs(rawArgs: string): {
@@ -501,10 +687,12 @@ function helpText(): string {
     `${PRIMARY_MENTION_ALIAS} config show|defaults|set             - manage plugin runtime settings`,
     `${PRIMARY_MENTION_ALIAS} role list|set|remove                 - manage role bindings for the bound project`,
     `${PRIMARY_MENTION_ALIAS} action <name> <json-payload>         - create an approval-gated external action`,
+    `${PRIMARY_MENTION_ALIAS} grants                               - list active reusable external-action approvals`,
     `${PRIMARY_MENTION_ALIAS} skills                               - list loaded skill routes for this repo`,
     `${PRIMARY_MENTION_ALIAS} unbind                               - remove the current binding`,
-    `${PRIMARY_MENTION_ALIAS} approve <request-id>                 - maintainer/owner approval for pending write request`,
+    `${PRIMARY_MENTION_ALIAS} approve <request-id> [--future ...]  - approve a pending request, optionally create reusable approval`,
     `${PRIMARY_MENTION_ALIAS} reject <request-id> [reason]         - reject pending write request`,
+    `${PRIMARY_MENTION_ALIAS} revoke <grant-id|request-id|skill>   - revoke reusable external-action approval`,
     `${PRIMARY_MENTION_ALIAS} <question>                           - ask the configured reasoning backend (default behavior)`,
   ].join("\n");
 }
@@ -815,9 +1003,11 @@ const WHOAMI_ACTIONS: Array<
 function buildWhoAmIText(params: {
   provider: string;
   conversationKey: string;
+  historyConversationKey: string;
   context: ConversationKeyContext;
   rolePolicyState: RolePolicyState;
   binding: ConversationBinding | undefined;
+  agentProfile?: AgentProfile;
 }): string {
   const actor = actorPrincipal(params.provider, params.context);
   const detectedSender = asString(params.context.from) || "unknown";
@@ -840,6 +1030,11 @@ function buildWhoAmIText(params: {
     `Provider: ${params.provider}`,
     `Conversation key: ${params.conversationKey}`,
   ];
+
+  if (params.agentProfile) {
+    lines.push(`Agent profile: ${params.agentProfile.id}`);
+    lines.push(`History context key: ${params.historyConversationKey}`);
+  }
 
   if (!params.binding) {
     lines.push(`Bound repo: none (run ${PRIMARY_MENTION_ALIAS} bind <repo-path> first)`);
@@ -1354,6 +1549,7 @@ async function resolveSkillMatchForAsk(params: {
 async function runCodexWithHistory(params: {
   prompt: string;
   conversationKey: string;
+  historyConversationKey?: string;
   repoPath: string;
   deps: GovernDeps;
   actorLabel?: string;
@@ -1369,10 +1565,11 @@ async function runCodexWithHistory(params: {
     : normalizedPrompt;
 
   const maxHistory = historyMaxMessages(params.deps);
-  const history = await params.deps.history.recent(params.conversationKey, maxHistory);
+  const historyConversationKey = params.historyConversationKey || params.conversationKey;
+  const history = await params.deps.history.recent(historyConversationKey, maxHistory);
 
   await params.deps.history.append({
-    conversationKey: params.conversationKey,
+    conversationKey: historyConversationKey,
     role: "user",
     content: promptWithActor,
     maxEntries: maxHistory,
@@ -1387,7 +1584,7 @@ async function runCodexWithHistory(params: {
     );
 
     await params.deps.history.append({
-      conversationKey: params.conversationKey,
+      conversationKey: historyConversationKey,
       role: "assistant",
       content: result.text,
       maxEntries: maxHistory,
@@ -1396,7 +1593,7 @@ async function runCodexWithHistory(params: {
     return { text: result.text };
   } catch (error) {
     await params.deps.history.append({
-      conversationKey: params.conversationKey,
+      conversationKey: historyConversationKey,
       role: "assistant",
       content: `Error: ${formatError(error)}`,
       maxEntries: maxHistory,
@@ -1421,11 +1618,157 @@ async function runAskPrompt(
   return await runCodexWithHistory({
     prompt,
     conversationKey,
+    historyConversationKey: options.historyConversationKey,
     repoPath: binding.repoPath,
     deps,
     actorLabel: options.actorLabel,
     configOverride: options.configOverride,
   });
+}
+
+async function createApprovalGrantFromRequest(params: {
+  deps: GovernDeps;
+  request: {
+    id: string;
+    projectId: string;
+    repoPath: string;
+    requestedBy: string;
+    agentId?: string;
+    externalAction?: { name: string };
+  };
+  createdBy: string;
+  future: FutureGrantSpec;
+  scope: ApprovalGrantScope;
+}): Promise<ApprovalGrant> {
+  const actionName = params.request.externalAction?.name;
+  if (!actionName) {
+    throw new Error("Cannot create a reusable approval because this request has no external action name.");
+  }
+
+  return await params.deps.grants.create({
+    projectId: params.request.projectId,
+    repoPath: params.request.repoPath,
+    actionName,
+    agentId: params.request.agentId,
+    scope: params.scope,
+    grantedTo: params.scope === "requester" ? params.request.requestedBy : undefined,
+    remainingUses: params.future.remainingUses,
+    expiresAt: params.future.expiresAt,
+    sourceRequestId: params.request.id,
+    createdBy: params.createdBy,
+  });
+}
+
+async function consumeApprovalGrantForExternalAction(params: {
+  deps: GovernDeps;
+  repoPath: string;
+  actionName: string;
+  actorId: string;
+  agentId?: string;
+}): Promise<ApprovalGrant | undefined> {
+  return await params.deps.grants.consumeMatching({
+    repoPath: params.repoPath,
+    actionName: params.actionName,
+    requestedBy: params.actorId,
+    agentId: params.agentId,
+  });
+}
+
+function formatGrantCreatedText(grant: ApprovalGrant): string {
+  return [
+    `Reusable approval granted: ${grant.id}`,
+    `Action: ${grant.actionName}`,
+    formatGrantScopeText(grant),
+    formatGrantLimit(grant),
+    ...(grant.agentId ? [`Agent: ${grant.agentId}`] : []),
+  ].join("\n");
+}
+
+function formatGrantConsumedLine(grant: ApprovalGrant): string {
+  return `Reusable approval: ${grant.id} (${formatGrantScopeText(grant)}, ${formatGrantLimit(grant)})`;
+}
+
+async function listApprovalGrants(params: {
+  deps: GovernDeps;
+  repoPath: string;
+  agentId?: string;
+}): Promise<{ text: string }> {
+  const grants = await params.deps.grants.listActive({
+    repoPath: params.repoPath,
+    ...(typeof params.agentId === "string" ? { agentId: params.agentId } : {}),
+  });
+
+  if (grants.length === 0) {
+    return {
+      text: "No active reusable external-action approvals found for this project.",
+    };
+  }
+
+  return {
+    text: [
+      "Active reusable external-action approvals:",
+      ...grants.map((grant) =>
+        [
+          `- ${grant.id}`,
+          `action=${grant.actionName}`,
+          formatGrantScopeText(grant),
+          formatGrantLimit(grant),
+          ...(grant.agentId ? [`agent=${grant.agentId}`] : []),
+        ].join(" | "),
+      ),
+    ].join("\n"),
+  };
+}
+
+async function revokeApprovalGrant(params: {
+  deps: GovernDeps;
+  target: string;
+  revokedBy: string;
+  revokedReason?: string;
+  repoPath?: string;
+  agentId?: string;
+  scope?: ApprovalGrantScope;
+}): Promise<{ text: string }> {
+  if (params.target.startsWith("grant_")) {
+    const revoked = await params.deps.grants.revokeById({
+      id: params.target,
+      revokedBy: params.revokedBy,
+      revokedReason: params.revokedReason,
+    });
+    if (!revoked) {
+      throw new Error(`Reusable approval not found: ${params.target}`);
+    }
+
+    return {
+      text: [
+        `Revoked reusable approval ${revoked.id}.`,
+        `Action: ${revoked.actionName}`,
+        formatGrantScopeText(revoked),
+      ].join("\n"),
+    };
+  }
+
+  const revoked = await params.deps.grants.revokeMatching({
+    ...(params.target.startsWith("appr_")
+      ? { sourceRequestId: params.target }
+      : { actionName: params.target }),
+    ...(params.repoPath ? { repoPath: params.repoPath } : {}),
+    ...(typeof params.agentId === "string" ? { agentId: params.agentId } : {}),
+    ...(params.scope ? { scope: params.scope } : {}),
+    revokedBy: params.revokedBy,
+    revokedReason: params.revokedReason,
+  });
+
+  if (revoked.length === 0) {
+    throw new Error(`No active reusable approvals matched "${params.target}".`);
+  }
+
+  return {
+    text: [
+      `Revoked ${revoked.length} reusable approval${revoked.length === 1 ? "" : "s"}.`,
+      ...revoked.map((grant) => `- ${grant.id} (${grant.actionName})`),
+    ].join("\n"),
+  };
 }
 
 async function handleApprovalDecision(params: {
@@ -1473,6 +1816,10 @@ async function handleApprovalDecision(params: {
   const approverId = actorPrincipal(params.provider, params.context);
 
   if (params.decision === "rejected") {
+    if (parsed.future) {
+      throw new Error("Reusable approvals can only be created with approve, not reject.");
+    }
+
     await params.deps.approvals.decide({
       id: request.id,
       status: "rejected",
@@ -1501,10 +1848,11 @@ async function handleApprovalDecision(params: {
   );
 
   enforceProjectAccessForRepo("ask", request.repoPath, authorization.decision, params.conversationKey);
+  const requestHistoryConversationKey = request.historyConversationKey || params.conversationKey;
 
   if (request.requestType === "external-action" || request.requestType === "webhook-action") {
     const requestConfig = applyProjectPolicyRuntimeDefaults(authorization.effectiveConfig, policy);
-    const history = await params.deps.history.recent(params.conversationKey, 20);
+    const history = await params.deps.history.recent(requestHistoryConversationKey, 20);
     const actionResult = await executeApprovedWebhookAction({
       config: requestConfig,
       request,
@@ -1520,12 +1868,24 @@ async function handleApprovalDecision(params: {
       decisionReason: parsed.reason,
     });
 
+    const grant =
+      parsed.future && request.requestType === "external-action"
+        ? await createApprovalGrantFromRequest({
+            deps: params.deps,
+            request,
+            createdBy: approverId,
+            future: parsed.future,
+            scope: parsed.scope || "requester",
+          })
+        : undefined;
+
     const reasonText = parsed.reason ? `\nReason: ${parsed.reason}` : "";
     const actionName = request.externalAction?.name || "unknown";
     const naturalResponse = await naturalizeExternalActionResponse({
       deps: params.deps,
       repoPath: request.repoPath,
       conversationKey: params.conversationKey,
+      historyConversationKey: requestHistoryConversationKey,
       userPrompt: externalActionUserPrompt(request),
       actionName,
       rawResponse: actionResult.responseSummary,
@@ -1538,8 +1898,13 @@ async function handleApprovalDecision(params: {
         `Approved by: ${approverId} (${approverRole})${reasonText}`,
         `Executed action: ${actionName}`,
         `Webhook response: ${naturalResponse}`,
+        ...(grant ? ["", formatGrantCreatedText(grant)] : []),
       ].join("\n"),
     };
+  }
+
+  if (parsed.future) {
+    throw new Error("Reusable approvals are only supported for external actions.");
   }
 
   const ticketRef = request.ticketRef || extractTicketReference(request.prompt);
@@ -1560,6 +1925,7 @@ async function handleApprovalDecision(params: {
   const result = await runCodexWithHistory({
     prompt: request.prompt,
     conversationKey: params.conversationKey,
+    historyConversationKey: requestHistoryConversationKey,
     repoPath: request.repoPath,
     deps: params.deps,
     actorLabel: request.requestedBy,
@@ -1588,11 +1954,13 @@ async function handleApprovalDecision(params: {
 async function createExternalActionApproval(params: {
   deps: GovernDeps;
   conversationKey: string;
+  historyConversationKey: string;
   provider: string;
   repoPath: string;
   actorId: string;
   actorRole: ProjectRole;
   policy: ProjectPolicy;
+  agentId?: string;
   actionName: string;
   actionSummary: string;
   actionPayload: Record<string, unknown>;
@@ -1611,6 +1979,8 @@ async function createExternalActionApproval(params: {
     repoPath: params.repoPath,
     prompt,
     requestedBy: params.actorId,
+    agentId: params.agentId,
+    historyConversationKey: params.historyConversationKey,
     requestedRole: params.actorRole,
     requiredRole,
     requestType: "external-action",
@@ -1631,6 +2001,8 @@ async function createExternalActionApproval(params: {
       ...approvalPreviewLines(params.actionPayload),
       `Approver roles: ${approverRoles(params.policy).join(", ")}`,
       `Approve with: ${PRIMARY_MENTION_ALIAS} approve ${request.id}`,
+      `Approve future requester access: ${PRIMARY_MENTION_ALIAS} approve ${request.id} --future 10 --scope requester`,
+      `Approve future team access: ${PRIMARY_MENTION_ALIAS} approve ${request.id} --future 1d --scope all`,
       `Reject with: ${PRIMARY_MENTION_ALIAS} reject ${request.id} <reason>`,
     ].join("\n"),
   };
@@ -1639,15 +2011,19 @@ async function createExternalActionApproval(params: {
 async function executeExternalActionDirectly(params: {
   deps: GovernDeps;
   conversationKey: string;
+  historyConversationKey: string;
   provider: string;
   repoPath: string;
   actorId: string;
   actorRole: ProjectRole;
   policy: ProjectPolicy;
+  agentId?: string;
   actionName: string;
   actionSummary: string;
   actionPayload: Record<string, unknown>;
   sourceLabel: string;
+  approvalReason?: string;
+  grant?: ApprovalGrant;
 }): Promise<{ text: string }> {
   const requiredRole = minRequiredRoleForAction(params.policy, "externalApi");
   const prompt = `External action direct-run (${params.sourceLabel}): ${params.actionName}\n${params.actionSummary}`;
@@ -1658,6 +2034,8 @@ async function executeExternalActionDirectly(params: {
     repoPath: params.repoPath,
     prompt,
     requestedBy: params.actorId,
+    agentId: params.agentId,
+    historyConversationKey: params.historyConversationKey,
     requestedRole: params.actorRole,
     requiredRole,
     requestType: "external-action",
@@ -1672,21 +2050,22 @@ async function executeExternalActionDirectly(params: {
     config: applyProjectPolicyRuntimeDefaults(params.deps.config, params.policy),
     request,
     approvedBy: params.actorId,
-    approvalReason: "Auto-approved by externalApi permission",
-    discussion: await params.deps.history.load(params.conversationKey),
+    approvalReason: params.approvalReason || "Auto-approved by externalApi permission",
+    discussion: await params.deps.history.load(params.historyConversationKey),
   });
 
   await params.deps.approvals.decide({
     id: request.id,
     status: "approved",
     decisionBy: params.actorId,
-    decisionReason: "Auto-approved by externalApi permission",
+    decisionReason: params.approvalReason || "Auto-approved by externalApi permission",
   });
 
   const naturalResponse = await naturalizeExternalActionResponse({
-    deps: params.deps,
-    repoPath: params.repoPath,
+      deps: params.deps,
+      repoPath: params.repoPath,
       conversationKey: params.conversationKey,
+      historyConversationKey: params.historyConversationKey,
       userPrompt: asString(asRecord(asRecord(params.actionPayload).input).prompt) || params.actionSummary,
       actionName: params.actionName,
       rawResponse: actionResult.responseSummary,
@@ -1700,6 +2079,7 @@ async function executeExternalActionDirectly(params: {
       `Summary: ${params.actionSummary}`,
       `Executed by: ${params.actorId} (${params.actorRole})`,
       `Source: ${params.sourceLabel}`,
+      ...(params.grant ? [formatGrantConsumedLine(params.grant)] : []),
       ...approvalPreviewLines(params.actionPayload),
       `Webhook response: ${naturalResponse}`,
     ].join("\n"),
@@ -1710,6 +2090,7 @@ async function executeGovernArgs(
   args: string,
   context: ConversationKeyContext,
   deps: GovernDeps,
+  execution: GovernExecutionOptions = {},
 ): Promise<{ text: string }> {
   await refreshManagedConfigFromDisk(deps);
 
@@ -1730,8 +2111,9 @@ async function executeGovernArgs(
   const rest = (spaceIndex >= 0 ? trimmedArgs.slice(spaceIndex + 1) : "").trim();
 
   const { key: conversationKey, provider } = resolveConversationKey(context);
+  const historyConversationKey = effectiveHistoryConversationKey(conversationKey, execution);
   const actorId = actorPrincipal(provider, context);
-  const boundConversation = await deps.store.get(conversationKey);
+  const boundConversation = execution.fixedBinding || (await deps.store.get(conversationKey));
   const rolePolicyState = await loadRolePolicyState(deps.config, boundConversation?.repoPath);
 
   if (subcommand === "help") {
@@ -1743,9 +2125,11 @@ async function executeGovernArgs(
       text: buildWhoAmIText({
         provider,
         conversationKey,
+        historyConversationKey,
         context,
         rolePolicyState,
         binding: boundConversation,
+        agentProfile: execution.agentProfile,
       }),
     };
   }
@@ -1774,7 +2158,58 @@ async function executeGovernArgs(
     });
   }
 
+  if (subcommand === "revoke") {
+    const parsed = parseRevokeCommandArgs(rest);
+
+    let targetRepoPath = boundConversation?.repoPath;
+    if (parsed.target.startsWith("grant_")) {
+      const grant = await deps.grants.get(parsed.target);
+      if (!grant) {
+        throw new Error(`Reusable approval not found: ${parsed.target}`);
+      }
+      targetRepoPath = grant.repoPath;
+    } else if (parsed.target.startsWith("appr_")) {
+      const request = await deps.approvals.get(parsed.target);
+      if (!request) {
+        throw new Error(`Approval request not found: ${parsed.target}`);
+      }
+      targetRepoPath = request.repoPath;
+    }
+
+    if (!targetRepoPath) {
+      throw new Error("No repository is available for revoke. Bind a repo or use a grant/request id.");
+    }
+
+    const revokeRolePolicy = await loadRolePolicyState(deps.config, targetRepoPath);
+    const revokePolicy = enforceProjectPolicyExistsForRepo(revokeRolePolicy, targetRepoPath);
+    if (!revokePolicy) {
+      throw new Error(`No policy found for repository: ${targetRepoPath}`);
+    }
+
+    roleForActionOrThrow({
+      policy: revokePolicy,
+      provider,
+      context,
+      action: "approve",
+      actionLabel: "revoke reusable approval",
+    });
+
+    return await revokeApprovalGrant({
+      deps,
+      target: parsed.target,
+      revokedBy: actorId,
+      revokedReason: parsed.reason,
+      repoPath: parsed.target.startsWith("grant_") || parsed.target.startsWith("appr_") ? undefined : targetRepoPath,
+      agentId: execution.agentProfile?.id,
+      scope: parsed.scope,
+    });
+  }
+
   if (subcommand === "bind") {
+    if (execution.agentProfile) {
+      throw new Error(agentBoundCommandMessage(execution.agentProfile, "bind"));
+    }
+
     const previousBinding = boundConversation;
     const parsed = parseBindArgs(rest);
     const authorization = await resolveAuthorization(
@@ -1869,8 +2304,11 @@ async function executeGovernArgs(
     }
 
     const metadataText = binding.metadata ? `\nMetadata: ${JSON.stringify(binding.metadata)}` : "";
+    const agentText = execution.agentProfile
+      ? `\nAgent: ${execution.agentProfile.id}\nHistory key: ${historyConversationKey}`
+      : "";
     return {
-      text: `Binding status:\nKey: ${conversationKey}\nProvider: ${binding.provider}\nRepo: ${binding.repoPath}\nUpdated: ${binding.updatedAt}${metadataText}`,
+      text: `Binding status:\nKey: ${conversationKey}\nProvider: ${binding.provider}\nRepo: ${binding.repoPath}\nUpdated: ${binding.updatedAt}${agentText}${metadataText}`,
     };
   }
 
@@ -1980,6 +2418,45 @@ async function executeGovernArgs(
     };
   }
 
+  if (subcommand === "grants") {
+    if (!boundConversation) {
+      throw new Error(noRepositoryBoundMessage());
+    }
+
+    const authorization = await resolveAuthorization(
+      {
+        action: "status",
+        provider,
+        conversationKey,
+        context,
+        requested: {
+          projectId: projectIdFromMetadata(boundConversation.metadata),
+          repoPath: boundConversation.repoPath,
+        },
+      },
+      deps,
+    );
+
+    enforceProjectAccessForRepo("ask", boundConversation.repoPath, authorization.decision, conversationKey);
+
+    const policy = enforceProjectPolicyExistsForRepo(rolePolicyState, boundConversation.repoPath);
+    if (policy) {
+      roleForActionOrThrow({
+        policy,
+        provider,
+        context,
+        action: "approve",
+        actionLabel: "list reusable approvals",
+      });
+    }
+
+    return await listApprovalGrants({
+      deps,
+      repoPath: boundConversation.repoPath,
+      agentId: execution.agentProfile?.id,
+    });
+  }
+
   if (subcommand === "action") {
     if (!boundConversation) {
       throw new Error(noRepositoryBoundMessage());
@@ -2035,11 +2512,13 @@ async function executeGovernArgs(
       return await executeExternalActionDirectly({
         deps,
         conversationKey,
+        historyConversationKey,
         provider,
         repoPath: boundConversation.repoPath,
         actorId,
         actorRole,
         policy,
+        agentId: execution.agentProfile?.id,
         actionName: action.name,
         actionSummary: action.summary,
         actionPayload: action.payload,
@@ -2047,14 +2526,43 @@ async function executeGovernArgs(
       });
     }
 
+    const matchingGrant = await consumeApprovalGrantForExternalAction({
+      deps,
+      repoPath: boundConversation.repoPath,
+      actionName: action.name,
+      actorId,
+      agentId: execution.agentProfile?.id,
+    });
+    if (matchingGrant) {
+      return await executeExternalActionDirectly({
+        deps,
+        conversationKey,
+        historyConversationKey,
+        provider,
+        repoPath: boundConversation.repoPath,
+        actorId,
+        actorRole,
+        policy,
+        agentId: execution.agentProfile?.id,
+        actionName: action.name,
+        actionSummary: action.summary,
+        actionPayload: action.payload,
+        sourceLabel: `reusable approval ${matchingGrant.id}`,
+        approvalReason: `Auto-approved by reusable approval ${matchingGrant.id}`,
+        grant: matchingGrant,
+      });
+    }
+
     return await createExternalActionApproval({
       deps,
       conversationKey,
+      historyConversationKey,
       provider,
       repoPath: boundConversation.repoPath,
       actorId,
       actorRole,
       policy,
+      agentId: execution.agentProfile?.id,
       actionName: action.name,
       actionSummary: action.summary,
       actionPayload: action.payload,
@@ -2063,6 +2571,10 @@ async function executeGovernArgs(
   }
 
   if (subcommand === "unbind") {
+    if (execution.agentProfile) {
+      throw new Error(agentBoundCommandMessage(execution.agentProfile, "unbind"));
+    }
+
     const binding = boundConversation;
 
     await resolveAuthorization(
@@ -2142,6 +2654,7 @@ async function executeGovernArgs(
       binding,
       actorLabel: actorId,
       configOverride: authorization.effectiveConfig,
+      historyConversationKey,
     });
   }
 
@@ -2196,11 +2709,13 @@ async function executeGovernArgs(
       return await executeExternalActionDirectly({
         deps,
         conversationKey,
+        historyConversationKey,
         provider,
         repoPath: binding.repoPath,
         actorId,
         actorRole,
         policy,
+        agentId: execution.agentProfile?.id,
         actionName: skillMatch.matched.route.name,
         actionSummary: skillMatch.matched.route.description || askPrompt,
         actionPayload,
@@ -2208,14 +2723,43 @@ async function executeGovernArgs(
       });
     }
 
+    const matchingGrant = await consumeApprovalGrantForExternalAction({
+      deps,
+      repoPath: binding.repoPath,
+      actionName: skillMatch.matched.route.name,
+      actorId,
+      agentId: execution.agentProfile?.id,
+    });
+    if (matchingGrant) {
+      return await executeExternalActionDirectly({
+        deps,
+        conversationKey,
+        historyConversationKey,
+        provider,
+        repoPath: binding.repoPath,
+        actorId,
+        actorRole,
+        policy,
+        agentId: execution.agentProfile?.id,
+        actionName: skillMatch.matched.route.name,
+        actionSummary: skillMatch.matched.route.description || askPrompt,
+        actionPayload,
+        sourceLabel: `reusable approval ${matchingGrant.id}`,
+        approvalReason: `Auto-approved by reusable approval ${matchingGrant.id}`,
+        grant: matchingGrant,
+      });
+    }
+
     return await createExternalActionApproval({
       deps,
       conversationKey,
+      historyConversationKey,
       provider,
       repoPath: binding.repoPath,
       actorId,
       actorRole,
       policy,
+      agentId: execution.agentProfile?.id,
       actionName: skillMatch.matched.route.name,
       actionSummary: skillMatch.matched.route.description || askPrompt,
       actionPayload,
@@ -2228,6 +2772,7 @@ async function executeGovernArgs(
       binding,
       actorLabel: actorId,
       configOverride: applyProjectPolicyRuntimeDefaults(authorization.effectiveConfig, policy),
+      historyConversationKey,
     });
   }
 
@@ -2260,6 +2805,8 @@ async function executeGovernArgs(
       repoPath: binding.repoPath,
       prompt: askPrompt,
       requestedBy: actorId,
+      agentId: execution.agentProfile?.id,
+      historyConversationKey,
       requestedRole: actorRole,
       requiredRole,
       ticketRef,
@@ -2292,6 +2839,7 @@ async function executeGovernArgs(
     binding,
     actorLabel: actorId,
     configOverride: writeConfig,
+    historyConversationKey,
   });
 }
 
@@ -2299,9 +2847,10 @@ export async function runGovern(
   args: string,
   context: ConversationKeyContext,
   deps: GovernDeps,
+  execution: GovernExecutionOptions = {},
 ): Promise<{ text: string }> {
   try {
-    return await executeGovernArgs(args, context, deps);
+    return await executeGovernArgs(args, context, deps, execution);
   } catch (error) {
     return { text: `Error: ${formatError(error)}` };
   }

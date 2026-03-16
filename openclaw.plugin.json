@@ -67,6 +67,49 @@
           "@hiveping"
         ]
       },
+      "agents": {
+        "type": "array",
+        "description": "Optional fixed agent profiles. Each profile can pin a mention alias to a repository and a home conversation key so shared channels can reuse project-specific context.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "repoPath",
+            "homeConversationKey"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "aliases": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "mentionIds": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "allowedChannels": {
+              "type": "array",
+              "description": "Optional list of channel identifiers or names where this agent may be used. Matches against conversation keys, ids, and provider metadata such as channelName when available.",
+              "items": {
+                "type": "string"
+              }
+            },
+            "repoPath": {
+              "type": "string"
+            },
+            "homeConversationKey": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "defaultSandbox": {
         "type": "string",
         "enum": [
@@ -201,6 +244,9 @@
     },
     "mentionAliases": {
       "label": "Mention aliases"
+    },
+    "agents": {
+      "label": "Agent profiles"
     },
     "defaultSandbox": {
       "label": "Default sandbox"

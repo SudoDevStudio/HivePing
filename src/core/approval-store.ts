@@ -118,6 +118,9 @@ function normalizeRequest(raw: unknown): ApprovalRequest | undefined {
     repoPath: value.repoPath,
     prompt: value.prompt,
     requestedBy: value.requestedBy,
+    agentId: typeof value.agentId === "string" ? value.agentId : undefined,
+    historyConversationKey:
+      typeof value.historyConversationKey === "string" ? value.historyConversationKey : undefined,
     requestedRole: value.requestedRole as ProjectRole,
     requiredRole: value.requiredRole as ProjectRole,
     ticketRef: typeof value.ticketRef === "string" ? value.ticketRef : undefined,
@@ -213,6 +216,8 @@ export class ApprovalStore {
     repoPath: string;
     prompt: string;
     requestedBy: string;
+    agentId?: string;
+    historyConversationKey?: string;
     requestedRole: ProjectRole;
     requiredRole: ProjectRole;
     ticketRef?: string;
@@ -235,6 +240,8 @@ export class ApprovalStore {
       repoPath: input.repoPath,
       prompt: input.prompt,
       requestedBy: input.requestedBy,
+      agentId: input.agentId,
+      historyConversationKey: input.historyConversationKey,
       requestedRole: input.requestedRole,
       requiredRole: input.requiredRole,
       ticketRef: input.ticketRef,

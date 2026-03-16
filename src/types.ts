@@ -1,6 +1,16 @@
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type ApprovalPolicyMode = "untrusted" | "on-request" | "never";
 export type SkillRoutingMode = "rules" | "agent";
+export type ApprovalGrantScope = "requester" | "all";
+
+export type AgentProfile = {
+  id: string;
+  aliases?: string[];
+  mentionIds?: string[];
+  allowedChannels?: string[];
+  repoPath: string;
+  homeConversationKey: string;
+};
 
 export type PluginConfig = {
   openclawCommand?: string;
@@ -13,6 +23,7 @@ export type PluginConfig = {
   allowedRoots?: string[];
   mentionHookEnabled?: boolean;
   mentionAliases?: string[];
+  agents?: AgentProfile[];
   defaultSandbox?: SandboxMode;
   defaultApprovalPolicy?: ApprovalPolicyMode;
   defaultModel?: string;
@@ -99,6 +110,8 @@ export type ApprovalRequest = {
   repoPath: string;
   prompt: string;
   requestedBy: string;
+  agentId?: string;
+  historyConversationKey?: string;
   requestedRole: ProjectRole;
   requiredRole: ProjectRole;
   ticketRef?: string;
@@ -115,4 +128,29 @@ export type ApprovalRequest = {
 export type ApprovalFile = {
   version: 1;
   requests: Record<string, ApprovalRequest>;
+};
+
+export type ApprovalGrant = {
+  id: string;
+  status: "active" | "revoked" | "exhausted";
+  createdAt: string;
+  updatedAt: string;
+  projectId: string;
+  repoPath: string;
+  actionName: string;
+  agentId?: string;
+  scope: ApprovalGrantScope;
+  grantedTo?: string;
+  remainingUses?: number;
+  expiresAt?: string;
+  sourceRequestId?: string;
+  createdBy: string;
+  revokedAt?: string;
+  revokedBy?: string;
+  revokedReason?: string;
+};
+
+export type ApprovalGrantFile = {
+  version: 1;
+  grants: Record<string, ApprovalGrant>;
 };
