@@ -1,8 +1,10 @@
+import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { runGovern, type GovernDeps } from "../commands/govern.js";
 import { allMentionAliases, resolveAgentProfiles } from "../core/agent-profiles.js";
 import { DEFAULT_MENTION_ALIASES, PLUGIN_ID, PLUGIN_NAME } from "../core/branding.js";
+import { callReasoningOnce } from "../core/codex-client.js";
 import { resolveConversationKey } from "../providers/index.js";
 import type { AgentProfile, ConversationKeyContext, PluginConfig } from "../types.js";
 
@@ -42,6 +44,7 @@ type MentionReplyDelivery = {
 
 type MentionHookOptions = {
   sendReply?: (delivery: MentionReplyDelivery) => Promise<void>;
+  consolidateReply?: (params: { prompt: string; results: AgentExecutionResult[] }) => Promise<string>;
 };
 
 type MentionInvocation = {
@@ -1169,11 +1172,79 @@ function formatConsolidatedAgentReply(args: string, results: AgentExecutionResul
   return lines.join("\n");
 }
 
+function commonDirectory(paths: string[]): string {
+  if (paths.length === 0) {
+    return process.cwd();
+  }
+
+  let shared = path.resolve(paths[0] || process.cwd());
+  for (const rawPath of paths.slice(1)) {
+    const candidate = path.resolve(rawPath);
+    while (!candidate.startsWith(shared + path.sep) && candidate !== shared && shared !== path.dirname(shared)) {
+      shared = path.dirname(shared);
+    }
+    if (candidate === shared || candidate.startsWith(shared + path.sep)) {
+      continue;
+    }
+    shared = path.dirname(shared);
+  }
+
+  return shared;
+}
+
+function buildConsolidationPrompt(prompt: string, results: AgentExecutionResult[]): string {
+  const sections = results.map((result) => {
+    const label = result.agentProfile.id;
+    const body = result.error
+      ? `Status: error\nDetails: ${result.error}`
+      : `Status: ok\nDetails:\n${result.text.trim() || "(no reply)"}`;
+    return `Agent: ${label}\n${body}`;
+  });
+
+  return [
+    "You are consolidating completed HivePing multi-agent results.",
+    "Do not inspect repositories or run new work. Use only the findings below.",
+    "Write one final answer for the user, not a transcript.",
+    "Start with the direct conclusion, then summarize key evidence from each agent, and call out any conflicts or next checks if needed.",
+    "",
+    `Original user request: ${prompt.trim() || "(no prompt)"}`,
+    "",
+    "Agent findings:",
+    ...sections.flatMap((section) => [section, ""]),
+  ].join("\n");
+}
+
+async function synthesizeConsolidatedAgentReply(
+  prompt: string,
+  results: AgentExecutionResult[],
+  deps: GovernDeps,
+  options: MentionHookOptions,
+): Promise<string> {
+  if (typeof options.consolidateReply === "function") {
+    return (await options.consolidateReply({ prompt, results })).trim();
+  }
+
+  const repoPaths = results.map((result) => result.agentProfile.repoPath).filter((value) => value.trim().length > 0);
+  const cwd = commonDirectory(repoPaths);
+  const synthesisConfig: PluginConfig = {
+    ...deps.config,
+    defaultSandbox: "read-only",
+    defaultApprovalPolicy: "never",
+  };
+  const response = await callReasoningOnce(
+    synthesisConfig,
+    cwd,
+    buildConsolidationPrompt(prompt, results),
+  );
+  return response.text.trim();
+}
+
 async function runMentionInvocation(
   invocation: MentionInvocation | undefined,
   args: string,
   conversationContext: ConversationKeyContext,
   deps: GovernDeps,
+  options: MentionHookOptions,
 ): Promise<string> {
   const agentProfiles = invocation?.agentProfiles || [];
   const restrictedAgents = invocation?.restrictedAgents || [];
@@ -1187,7 +1258,11 @@ async function runMentionInvocation(
     if (restrictedResults.length === 1) {
       return `Error: ${restrictedResults[0]?.error || "Agent is not allowed in this channel."}`;
     }
-    return formatConsolidatedAgentReply(args, restrictedResults).trim();
+    try {
+      return await synthesizeConsolidatedAgentReply(args, restrictedResults, deps, options);
+    } catch {
+      return formatConsolidatedAgentReply(args, restrictedResults).trim();
+    }
   }
 
   if (agentProfiles.length <= 1) {
@@ -1213,10 +1288,15 @@ async function runMentionInvocation(
     if (restrictedResults.length === 0) {
       return text;
     }
-    return formatConsolidatedAgentReply(args, [
+    const combinedResults = [
       ...(agentProfile ? [{ agentProfile, text }] : []),
       ...restrictedResults,
-    ]).trim();
+    ];
+    try {
+      return await synthesizeConsolidatedAgentReply(args, combinedResults, deps, options);
+    } catch {
+      return formatConsolidatedAgentReply(args, combinedResults).trim();
+    }
   }
 
   const results: AgentExecutionResult[] = [];
@@ -1249,7 +1329,12 @@ async function runMentionInvocation(
     }
   }
 
-  return formatConsolidatedAgentReply(args, [...results, ...restrictedResults]).trim();
+  const combinedResults = [...results, ...restrictedResults];
+  try {
+    return await synthesizeConsolidatedAgentReply(args, combinedResults, deps, options);
+  } catch {
+    return formatConsolidatedAgentReply(args, combinedResults).trim();
+  }
 }
 
 function shouldSuppressDefaultTurn(event: unknown, ctx: unknown, aliases: string[]): boolean {
@@ -1414,7 +1499,7 @@ export function registerMentionHook(
     markPendingSuppressionFallback();
 
     try {
-      const replyText = await runMentionInvocation(effectiveInvocation, args, conversationContext, deps);
+      const replyText = await runMentionInvocation(effectiveInvocation, args, conversationContext, deps, options);
       if (replyText.length === 0) {
         return { cancel: true };
       }

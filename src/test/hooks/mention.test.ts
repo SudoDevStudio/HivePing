@@ -501,6 +501,8 @@ test("mention hook blocks agent routing outside configured channels", async () =
 
 test("mention hook consolidates responses when multiple agent aliases are mentioned", async () => {
   const { api, handlers, deliveries, sendReply } = createApiHarness();
+  let consolidationPrompt = "";
+  let consolidationAgentIds: string[] = [];
   registerMentionHook(
     api,
     createDeps({
@@ -519,7 +521,14 @@ test("mention hook consolidates responses when multiple agent aliases are mentio
         },
       ],
     }),
-    { sendReply },
+    {
+      sendReply,
+      consolidateReply: async ({ prompt, results }) => {
+        consolidationPrompt = prompt;
+        consolidationAgentIds = results.map((result) => result.agentProfile.id);
+        return `Final model synthesis for ${results.map((result) => result.agentProfile.id).join(", ")}`;
+      },
+    },
   );
 
   const messageReceived = handlers.get("message_received");
@@ -544,11 +553,9 @@ test("mention hook consolidates responses when multiple agent aliases are mentio
 
   assert.equal(handled?.cancel, true);
   assert.equal(deliveries.length, 1);
-  assert.match(deliveries[0]?.content || "", /Consolidated multi-agent response/);
-  assert.match(deliveries[0]?.content || "", /== fe ==/);
-  assert.match(deliveries[0]?.content || "", /History key: slack:T_DEFAULT:C_FE/);
-  assert.match(deliveries[0]?.content || "", /== api ==/);
-  assert.match(deliveries[0]?.content || "", /History key: slack:T_DEFAULT:C_API/);
+  assert.equal(deliveries[0]?.content, "Final model synthesis for fe, api");
+  assert.equal(consolidationPrompt, "status");
+  assert.deepEqual(consolidationAgentIds, ["fe", "api"]);
 
   const suppressed = await messageSending?.(
     { to: "channel:C_SHARED" },
