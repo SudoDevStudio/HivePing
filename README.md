@@ -489,15 +489,15 @@ Copy the `Key: ...` value from each reply.
 docker compose run --rm openclaw-cli config set plugins.entries.hiveping.config.agents '[
   {
     "id": "project-a",
-    "repoPath": "/Users/sudodevstudio/devStudio/openclaw/organization/react-sample-app",
-    "homeConversationKey": "slack:default:C0ALVDSAFLL",
-    "allowedChannels": ["project-a-room", "slack:default:C0ALVDSAFLL"]
+    "repoPath": "/Workspace/.openclaw/organization/react-sample-app",
+    "homeConversationKey": "slack:default:CHANNEL_ID",
+    "allowedChannels": ["project-a-room", "slack:default:CHANNEL_ID"]
   },
   {
     "id": "project-b",
-    "repoPath": "/Users/sudodevstudio/devStudio/openclaw/organization/project-account",
-    "homeConversationKey": "slack:default:C0ALVDT83K6",
-    "allowedChannels": ["project-b-room", "slack:default:C0ALVDT83K6"]
+    "repoPath": "/Workspace/.openclaw/organization/project-account",
+    "homeConversationKey": "slack:default:CHANNEL_ID",
+    "allowedChannels": ["project-b-room", "slack:default:CHANNEL_ID"]
   }
 ]' --json
 ```
@@ -514,7 +514,7 @@ docker compose restart openclaw-gateway
 
 When set, matching is exact against whichever identifiers are available from the provider event, including:
 
-- the normalized conversation key, for example `slack:default:C0ALVDSAFLL`
+- the normalized conversation key, for example `slack:default:CHANNEL_ID`
 - raw conversation/channel ids
 - provider metadata such as `channelName` when available
 
