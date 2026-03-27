@@ -1,6 +1,3 @@
-<img width="1633" height="851" alt="Image" src="https://github.com/user-attachments/assets/a3745a2d-6b3c-4176-98cd-a545a8affa64" />
-
-
 # HivePing
 
 Demo: https://www.youtube.com/watch?v=EE8AI7FWZC0
