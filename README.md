@@ -1,6 +1,6 @@
 # HivePing
 
-Demo: https://www.youtube.com/watch?v=EE8AI7FWZC0
+[![HivePing Demo](https://img.youtube.com/vi/EE8AI7FWZC0/maxresdefault.jpg)](https://www.youtube.com/watch?v=EE8AI7FWZC0)
 
 Conversation-scoped mention bridge for OpenClaw channels (Discord, Slack, Microsoft Teams) with Codex as the default reasoning backend.
 
